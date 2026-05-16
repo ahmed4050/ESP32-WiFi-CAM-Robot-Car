@@ -18,6 +18,7 @@
 #include "esp_task_wdt.h"
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
 
 // ======== WiFi Manager ========
 WiFiManager wm;
@@ -50,8 +51,8 @@ WiFiManager wm;
 #define LED_GPIO_NUM 4
 
 // ======== Motor Speed ========
-int MOTOR_R_Speed = 100;
-int MOTOR_L_Speed = 100;
+int MOTOR_R_Speed = 170;
+int MOTOR_L_Speed = 170;
 
 // ======== Servers ========
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -594,6 +595,33 @@ void setup() {
   wm.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   wm.setCaptivePortalEnable(true);
   if (!wm.autoConnect("ESP32-CAM-Setup")) { ESP.restart(); }
+
+  // Print WiFi connection info
+  Serial.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.println("✅ WiFi Connected Successfully!");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.print("📍 IP Address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("📶 RSSI: ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+  Serial.print("🔌 MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  // Start mDNS service
+  if (MDNS.begin("esp32cam")) {
+    Serial.println("\n📡 mDNS Responder Started");
+    Serial.println("🌐 Access URLs:");
+    Serial.println("   • http://esp32cam.local");
+    Serial.println("   • http://esp32cam.local:81/stream");
+    
+    MDNS.addService("http", "tcp", 80);
+    MDNS.addService("ws", "tcp", 82);
+    Serial.println("✓ HTTP & WebSocket services advertised");
+  } else {
+    Serial.println("❌ Error starting mDNS");
+  }
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
   startCameraServer();
   startWebSocketServer();
