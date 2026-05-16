@@ -1,8 +1,7 @@
 /*
   Project: ESP32-CAM Robot Car
-  Author: Keyestudio (Modified)
-  Function: Control robot car via WiFi with camera streaming
-  Speed levels: Low=85, Mid=170, High=255
+  Author: Ahmed Alqassabi
+  Features: Strict Validation, FreeRTOS Restart Task, WebSocket (Port 82), Visual Keyboard UI
 */
 
 #include "esp_camera.h"
@@ -17,29 +16,31 @@
 #include <WiFiManager.h>
 #include "esp_system.h"
 #include "esp_task_wdt.h"
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 
-// ======== WiFi Manager Configuration ========
+// ======== WiFi Manager ========
 WiFiManager wm;
 
 // ======== Camera Pins (AI-THINKER) ========
-#define PWDN_GPIO_NUM 32
-#define RESET_GPIO_NUM -1
-#define XCLK_GPIO_NUM 0
-#define SIOD_GPIO_NUM 26
-#define SIOC_GPIO_NUM 27
-#define Y9_GPIO_NUM 35
-#define Y8_GPIO_NUM 34
-#define Y7_GPIO_NUM 39
-#define Y6_GPIO_NUM 36
-#define Y5_GPIO_NUM 21
-#define Y4_GPIO_NUM 19
-#define Y3_GPIO_NUM 18
-#define Y2_GPIO_NUM 5
-#define VSYNC_GPIO_NUM 25
-#define HREF_GPIO_NUM 23
-#define PCLK_GPIO_NUM 22
+#define PWDN_GPIO_NUM   32
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM    0
+#define SIOD_GPIO_NUM   26
+#define SIOC_GPIO_NUM   27
+#define Y9_GPIO_NUM     35
+#define Y8_GPIO_NUM     34
+#define Y7_GPIO_NUM     39
+#define Y6_GPIO_NUM     36
+#define Y5_GPIO_NUM     21
+#define Y4_GPIO_NUM     19
+#define Y3_GPIO_NUM     18
+#define Y2_GPIO_NUM      5
+#define VSYNC_GPIO_NUM  25
+#define HREF_GPIO_NUM   23
+#define PCLK_GPIO_NUM   22
 
-// ======== Motor Control Pins ========
+// ======== Motor Pins ========
 #define MOTOR_R_PIN_1 14
 #define MOTOR_R_PIN_2 15
 #define MOTOR_L_PIN_1 13
@@ -48,11 +49,11 @@ WiFiManager wm;
 // ======== LED Pin ========
 #define LED_GPIO_NUM 4
 
-// ======== Motor Speed Variables ========
-int MOTOR_R_Speed = 170;
-int MOTOR_L_Speed = 170;
+// ======== Motor Speed ========
+int MOTOR_R_Speed = 100;
+int MOTOR_L_Speed = 100;
 
-// ======== HTTP Server Handles ========
+// ======== Servers ========
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
@@ -61,240 +62,364 @@ static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 httpd_handle_t camera_httpd = NULL;
 httpd_handle_t stream_httpd = NULL;
 
-void startCameraServer();
+AsyncWebServer wsServer(82);
+AsyncWebSocket ws("/ws");
 
-// ======== LED Flash Function ========
-void blinkLED(int times = 3, int delayMs = 200) {
-  for (int i = 0; i < times; i++) {
+void startCameraServer();
+void startWebSocketServer();
+
+// ======== FreeRTOS Restart Task ========
+struct RestartTaskParams {
+  bool resetWifi;
+};
+
+static void restartTask(void *pvParameters) {
+  RestartTaskParams *params = (RestartTaskParams *)pvParameters;
+  bool resetWifi = params->resetWifi;
+  delete params;
+
+  vTaskDelay(pdMS_TO_TICKS(600)); // انتظر حتى يصل الرد للمتصفح
+
+  if (resetWifi) {
+    Serial.println("🔄 Resetting WiFi settings...");
+    wm.resetSettings();
+    vTaskDelay(pdMS_TO_TICKS(300));
+  }
+
+  Serial.println("♻️ Restarting ESP32...");
+  ESP.restart();
+  vTaskDelete(NULL);
+}
+
+static void scheduleRestart(bool resetWifi = false) {
+  RestartTaskParams *params = new RestartTaskParams{resetWifi};
+  xTaskCreate(restartTask, "restart_task", 2048, params, 1, NULL);
+}
+
+// ======== Strict Command Validation ========
+static bool query_equals(const char *query, const char *key, const char *value) {
+  char expected[64];
+  snprintf(expected, sizeof(expected), "%s=%s", key, value);
+  return strcmp(query, expected) == 0;
+}
+
+// ======== Motor Control Logic (Shared) ========
+void executeCommand(const char *cmd) {
+  if (strcmp(cmd, "forward") == 0) {
+    analogWrite(MOTOR_R_PIN_1, 0); analogWrite(MOTOR_R_PIN_2, MOTOR_R_Speed);
+    analogWrite(MOTOR_L_PIN_1, MOTOR_L_Speed); analogWrite(MOTOR_L_PIN_2, 0);
+  } else if (strcmp(cmd, "backward") == 0) {
+    analogWrite(MOTOR_R_PIN_1, MOTOR_R_Speed); analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0); analogWrite(MOTOR_L_PIN_2, MOTOR_L_Speed);
+  } else if (strcmp(cmd, "left") == 0) {
+    analogWrite(MOTOR_R_PIN_1, 0); analogWrite(MOTOR_R_PIN_2, MOTOR_R_Speed);
+    analogWrite(MOTOR_L_PIN_1, 0); analogWrite(MOTOR_L_PIN_2, MOTOR_L_Speed);
+  } else if (strcmp(cmd, "right") == 0) {
+    analogWrite(MOTOR_R_PIN_1, MOTOR_R_Speed); analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, MOTOR_L_Speed); analogWrite(MOTOR_L_PIN_2, 0);
+  } else if (strcmp(cmd, "stop") == 0) {
+    analogWrite(MOTOR_R_PIN_1, 0); analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0); analogWrite(MOTOR_L_PIN_2, 0);
+  } else if (strcmp(cmd, "led=on") == 0) {
     digitalWrite(LED_GPIO_NUM, HIGH);
-    delay(delayMs);
+  } else if (strcmp(cmd, "led=off") == 0) {
     digitalWrite(LED_GPIO_NUM, LOW);
-    delay(delayMs);
+  } else if (strcmp(cmd, "plus") == 0) {
+    MOTOR_R_Speed = min(MOTOR_R_Speed + 85, 255);
+    MOTOR_L_Speed = min(MOTOR_L_Speed + 85, 255);
+  } else if (strcmp(cmd, "minus") == 0) {
+    MOTOR_R_Speed = max(MOTOR_R_Speed - 85, 85);
+    MOTOR_L_Speed = max(MOTOR_L_Speed - 85, 85);
   }
 }
 
-// ======== WiFiManager Callbacks ========
-void configModeCallback(WiFiManager *myWiFiManager) {
-  Serial.println("\n========================================");
-  Serial.println("      WiFi Configuration Mode");
-  Serial.println("========================================");
-  Serial.print("AP SSID: ");
-  Serial.println(myWiFiManager->getConfigPortalSSID());
-  Serial.println("AP Password: None (Open Network)");
-  Serial.print("Config Portal IP: ");
-  Serial.println(WiFi.softAPIP());
-  Serial.println("Captive Portal: ENABLED");
-  Serial.println("Browser should open automatically!");
-  Serial.println("========================================\n");
-  
-  // إشارة LED بسيطة - غير محجبة
-  digitalWrite(LED_GPIO_NUM, HIGH);
-}
-
-void saveConfigCallback() {
-  Serial.println("✅ WiFi Configuration Saved!");
-  Serial.println("Connecting to network...");
-  
-  // إطفاء LED بعد الحفظ
-  digitalWrite(LED_GPIO_NUM, LOW);
-}
-
-// ======== HTML Web Interface ========
+// ======== HTML / UI ========
 static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 <html>
   <head>
     <title>ESP32-CAM Robot</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta charset="UTF-8"/>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>🤖</text></svg>">
     <style>
-      body {
-        font-family: Arial;
-        text-align: center;
-        margin: 0 auto;
-        padding-top: 20px;
-      }
-      .developer-info {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 15px;
-        margin: -20px -8px 20px -8px;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-      }
-      .developer-info h2 {
-        margin: 5px 0;
-        font-size: 22px;
-        text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-      }
-      .developer-info p {
-        margin: 3px 0;
-        font-size: 14px;
-        opacity: 0.95;
-      }
-      .developer-info .contact {
-        font-size: 12px;
-        margin-top: 8px;
-      }
-      .developer-info .icon {
-        font-size: 40px;
-        margin-bottom: 5px;
-      }
-      .button-container {
-        display: grid;
-        grid-template-areas:
-          "keyes forward led"
-          "left stop right"
-          "plus backward minus";
-        grid-gap: 10px;
-        justify-content: center;
-        align-content: center;
-        margin-top: 20px;
-      }
-      .button {
-        background-color: #2f4468;
-        color: white;
-        border: none;
-        padding: 20px 0;
-        text-align: center;
-        font-size: 18px;
-        cursor: pointer;
-        width: 90px;
-        height: 60px;
-        border-radius: 15px;
-      }
-      .led-button {
-        background-color: #777;
-        color: white;
-        border: none;
-        padding: 20px 0;
-        text-align: center;
-        font-size: 18px;
-        cursor: pointer;
-        width: 90px;
-        height: 60px;
-        border-radius: 15px;
-      }
-      .led-on {
-        background-color: #f0c40f;
-        color: black;
-      }
-      .forward { grid-area: forward; }
-      .led { grid-area: led; }
-      .left { grid-area: left; }
-      .stop { grid-area: stop; }
-      .right { grid-area: right; }
-      .backward { grid-area: backward; }
-      .plus { grid-area: plus; }
-      .minus { grid-area: minus; }
-      .keyes { grid-area: keyes; }
-      img {
-        width: auto;
-        max-width: 100%;
-        height: auto;
-        border: 2px solid #2f4468;
-        border-radius: 10px;
-        margin-top: 20px;
-      }
-      .settings-btn {
-        background-color: #e74c3c;
-        color: white;
-        border: none;
-        padding: 10px 20px;
-        margin: 10px;
-        font-size: 14px;
-        cursor: pointer;
-        border-radius: 5px;
-      }
-      .settings-btn:hover {
-        background-color: #c0392b;
-      }
-      .info-box {
-        background-color: #ecf0f1;
-        padding: 10px;
-        margin: 10px 0;
-        border-radius: 5px;
-        font-size: 14px;
-      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: Arial; background: #111; color: #eee; display: flex; flex-direction: column; align-items: center; padding-bottom: 20px;}
+
+      .header { width: 100%; background: linear-gradient(135deg, #667eea, #764ba2); padding: 12px; text-align: center; }
+      .header h2 { font-size: 18px; margin-bottom: 4px;}
+      .header p  { font-size: 12px; opacity: .85; }
+
+      .info-box { background: #1e1e1e; border: 1px solid #333; border-radius: 8px; padding: 8px 16px; font-size: 13px; margin: 10px 0; text-align: center; width: 92%; max-width: 480px;}
+      #wsStatus.ok { color: #1D9E75; }
+      #wsStatus.err { color: #E24B4A; }
+
+      img#photo { width: 92%; max-width: 480px; border-radius: 10px; border: 2px solid #2f4468; margin: 10px 0; }
+
+      #joy-container { display: flex; flex-direction: column; align-items: center; gap: 12px; margin: 10px 0; width: 100%; }
+      canvas#joy { touch-action: none; cursor: grab; }
+      #cmd-label { font-size: 15px; font-weight: bold; background: #1e1e1e; border: 1px solid #444; border-radius: 20px; padding: 6px 24px; min-width: 140px; text-align: center; transition: background .15s, color .15s; }
+      #cmd-label.active { background: #185FA5; color: #fff; }
+
+      .stats { display: flex; gap: 10px; }
+      .stat-box { background: #1e1e1e; border: 1px solid #333; border-radius: 8px; padding: 8px 16px; text-align: center; }
+      .stat-box small { font-size: 11px; color: #888; display: block; }
+      .stat-box span  { font-size: 17px; font-family: monospace; }
+
+      /* Visual Keyboard UI */
+      #keyHint { margin: 12px auto; background: #1e1e1e; border: 1px solid #333; border-radius: 10px; padding: 12px 20px; display: inline-block; text-align: center; width: 92%; max-width: 480px;}
+      .key { display: inline-flex; align-items: center; justify-content: center; width: 38px; height: 38px; background: #2a2a2a; border: 1px solid #444; border-bottom: 3px solid #333; border-radius: 6px; font-family: monospace; font-size: 13px; color: #ccc; transition: all .1s; user-select: none; }
+      .key.active { background: #185FA5; border-color: #378ADD; border-bottom-color: #0C447C; color: #fff; transform: translateY(2px); }
+      .stop-key { background: #2a1a1a; border-color: #663333; color: #cc6666; }
+      .stop-key.active { background: #7f1d1d; border-color: #E24B4A; color: #fff; }
+      .small-key { width: 30px; height: 30px; font-size: 12px; }
+
+      .controls { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin: 10px 0; }
+      .ctrl-btn { background: #1e1e1e; color: #eee; border: 1px solid #444; border-radius: 8px; padding: 10px 18px; font-size: 14px; cursor: pointer; }
+      .ctrl-btn:active { opacity: .7; }
+      .ctrl-btn.led-on  { background: #BA7517; border-color: #BA7517; color: #FAEEDA; }
+      .ctrl-btn.danger  { border-color: #e74c3c; color: #e74c3c; }
     </style>
   </head>
   <body>
-    <div class="developer-info">
-      <div class="icon">🤖</div>
-      <h2>AHMED ALQASSABI</h2>
-      <p class="contact">📱 +96899848382</p>
-      <p class="contact">📧 ahmed4050@gmail.com</p>
+    <div class="header">
+      <h2>🤖 AHMED ALQASSABI</h2>
+      <p>📱 +96899848382 &nbsp;|&nbsp; 📧 ahmed4050@gmail.com</p>
     </div>
-    <h1>ESP32-CAM Robot</h1>
+
     <div class="info-box">
-      <strong>WiFi:</strong> <span id="wifiInfo">Loading...</span><br>
-      <strong>IP:</strong> <span id="ipInfo">Loading...</span>
+      <strong>WS:</strong> <span id="wsStatus" style="color:#888">جاري الاتصال...</span>
+      &nbsp;|&nbsp;
+      <strong>IP:</strong> <span id="ipInfo">—</span>
+      &nbsp;|&nbsp;
+      <strong>RAM:</strong> <span id="heapInfo">—</span>
     </div>
-    <button class="settings-btn" onclick="resetWiFi()">🔄 Reset WiFi</button>
-    <button class="settings-btn" onclick="restartESP()">♻️ Restart ESP32</button>
-    <img src="" id="photo">
-    <div class="button-container">
-      <button class="button forward" onmousedown="toggleCheckbox('forward');" ontouchstart="toggleCheckbox('forward');" onmouseup="toggleCheckbox('stop');" ontouchend="toggleCheckbox('stop');">↑</button>
-      <button id="ledButton" class="led-button led" onclick="toggleLED()">OFF</button>
-      <button class="button left" onmousedown="toggleCheckbox('left');" ontouchstart="toggleCheckbox('left');" onmouseup="toggleCheckbox('stop');" ontouchend="toggleCheckbox('stop');">←</button>
-      <button class="button stop" onmousedown="toggleCheckbox('stop');">●</button>
-      <button class="button right" onmousedown="toggleCheckbox('right');" ontouchstart="toggleCheckbox('right');" onmouseup="toggleCheckbox('stop');" ontouchend="toggleCheckbox('stop');">→</button>
-      <button class="button backward" onmousedown="toggleCheckbox('backward');" ontouchstart="toggleCheckbox('backward');" onmouseup="toggleCheckbox('stop');" ontouchend="toggleCheckbox('stop');">↓</button>
-      <button class="button plus" onmouseup="toggleCheckbox('plus');">+</button>
-      <button class="button minus" onmouseup="toggleCheckbox('minus');">-</button>
-      <button class="button keyes">Keyes</button>
+
+    <img src="" id="photo" alt="camera">
+
+    <div id="joy-container">
+      <div id="cmd-label">ضع إصبعك هنا</div>
+      <canvas id="joy" width="240" height="240"></canvas>
+      <div class="stats">
+        <div class="stat-box"><small>سرعة</small><span id="vspd">0%</span></div>
+        <div class="stat-box"><small>اتجاه</small><span id="vdir">—</span></div>
+      </div>
     </div>
+
+    <div id="keyHint">
+      <div style="font-size:11px; color:#888; margin-bottom:8px;">تحكم بلوحة المفاتيح</div>
+      <div style="display:flex; gap:6px; justify-content:center; margin-bottom:6px;">
+        <div style="width:10px"></div><kbd class="key" id="k-w">W</kbd><kbd class="key" id="k-up">↑</kbd><div style="width:10px"></div>
+      </div>
+      <div style="display:flex; gap:6px; justify-content:center; margin-bottom:6px;">
+        <kbd class="key" id="k-a">A</kbd><kbd class="key stop-key" id="k-space">SPC</kbd><kbd class="key" id="k-d">D</kbd><kbd class="key" id="k-right">→</kbd>
+      </div>
+      <div style="display:flex; gap:6px; justify-content:center; margin-bottom:6px;">
+        <kbd class="key" id="k-left">←</kbd><kbd class="key" id="k-s">S</kbd><kbd class="key" id="k-down">↓</kbd>
+      </div>
+      <div style="display:flex; gap:6px; justify-content:center; margin-top:4px;">
+        <kbd class="key small-key" id="k-plus">+</kbd><kbd class="key small-key" id="k-minus">−</kbd><kbd class="key small-key" id="k-l">L</kbd>
+      </div>
+      <div style="font-size:10px; color:#555; margin-top:8px;">+/− سرعة &nbsp;|&nbsp; L إضاءة</div>
+      <div id="keyIndicator" style="font-size:22px; margin-top:8px; color:#378ADD; min-height:30px;">●</div>
+    </div>
+
+    <div class="controls">
+      <button id="ledBtn" class="ctrl-btn" onclick="toggleLED()">💡 LED: OFF</button>
+      <button class="ctrl-btn danger" onclick="resetWiFi()">🔄 Reset WiFi</button>
+      <button class="ctrl-btn danger" onclick="restartESP()">♻️ Restart</button>
+    </div>
+
     <script>
-      window.onload = function () {
-        document.getElementById("photo").src = window.location.href.slice(0, -1) + ":81/stream";
-        updateInfo();
+      // ======== WebSocket ========
+      var ws, wsReady = false, wsQueue = [];
+      var lastCmd = '', lastSent = 0;
+
+      function initWS() {
+        var wsUrl = "ws://" + window.location.hostname + ":82/ws";
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = function() {
+          wsReady = true;
+          var st = document.getElementById("wsStatus");
+          st.textContent = "متصل"; st.className = "ok";
+          wsQueue.forEach(function(cmd) { ws.send(cmd); });
+          wsQueue = [];
+        };
+
+        ws.onclose = function() {
+          wsReady = false;
+          var st = document.getElementById("wsStatus");
+          st.textContent = "منقطع — يعاود الاتصال..."; st.className = "err";
+          setTimeout(initWS, 2000);
+        };
+
+        ws.onerror = function() { ws.close(); };
+
+        ws.onmessage = function(e) {
+          try {
+            var d = JSON.parse(e.data);
+            if (d.heap) document.getElementById("heapInfo").textContent = Math.round(d.heap / 1024) + " KB";
+            if (d.ip) document.getElementById("ipInfo").textContent = d.ip;
+          } catch(err) {}
+        };
+      }
+
+      function sendCmd(cmd) {
+        var now = Date.now();
+        if (cmd === lastCmd && now - lastSent < 80) return;
+        lastCmd = cmd; lastSent = now;
+        if (wsReady) ws.send(cmd);
+        else wsQueue.push(cmd);
+      }
+
+      // ======== Init ========
+      window.onload = function() {
+        document.getElementById("photo").src = window.location.href.slice(0,-1) + ":81/stream";
+        initWS();
+        initJoystick();
       };
-      function updateInfo() {
-        fetch('/info')
-          .then(response => response.json())
-          .then(data => {
-            document.getElementById("wifiInfo").textContent = data.ssid + " (" + data.rssi + " dBm)";
-            document.getElementById("ipInfo").textContent = data.ip;
-          })
-          .catch(error => {
-            document.getElementById("wifiInfo").textContent = "N/A";
-            document.getElementById("ipInfo").textContent = "N/A";
-          });
+
+      // ======== Buttons ========
+      var ledOn = false;
+      function toggleLED() {
+        ledOn = !ledOn;
+        var btn = document.getElementById("ledBtn");
+        btn.textContent = ledOn ? "💡 LED: ON" : "💡 LED: OFF";
+        btn.classList.toggle("led-on", ledOn);
+        sendCmd(ledOn ? 'led=on' : 'led=off');
+        updateKeyIndicator(ledOn ? 'led=on' : 'led=off');
       }
-      function toggleCheckbox(action) {
-        var xhr = new XMLHttpRequest();
-        xhr.open("GET", "/action?go=" + action, true);
-        xhr.send();
-      }
+
       function resetWiFi() {
-        if (confirm("هل تريد إعادة ضبط إعدادات WiFi؟\n\nسيتم إعادة تشغيل ESP32 وفتح شبكة ESP32-CAM-Setup")) {
-          fetch('/action?reset=wifi')
-            .then(() => {
-              alert("تم إعادة ضبط WiFi!\n\nابحث عن شبكة: ESP32-CAM-Setup");
-            });
+        if (confirm("إعادة ضبط WiFi؟\n\nسيفتح الجهاز شبكة ESP32-CAM-Setup")) {
+          fetch("/action?reset=wifi").then(() => alert("ابحث عن شبكة: ESP32-CAM-Setup"));
         }
       }
       function restartESP() {
-        if (confirm("هل تريد إعادة تشغيل ESP32؟")) {
-          fetch('/action?reset=restart')
-            .then(() => {
-              alert("جاري إعادة التشغيل...\n\nانتظر 10 ثواني ثم حدّث الصفحة");
-            });
+        if (confirm("إعادة تشغيل الجهاز؟")) {
+          fetch("/action?reset=restart").then(() => alert("انتظر 10 ثواني ثم حدّث الصفحة"));
         }
       }
-      let ledState = false;
-      const ledButton = document.getElementById("ledButton");
-      function toggleLED() {
-        ledState = !ledState;
-        if (ledState) {
-          ledButton.classList.add("led-on");
-          ledButton.textContent = "ON";
-        } else {
-          ledButton.classList.remove("led-on");
-          ledButton.textContent = "OFF";
+
+      // ======== Keyboard Logic ========
+      var pressedKeys = {};
+      var keyMap = {
+        'ArrowUp':'forward', 'ArrowDown':'backward', 'ArrowLeft':'left', 'ArrowRight':'right',
+        'w':'forward', 'W':'forward', 's':'backward', 'S':'backward', 'a':'left', 'A':'left', 'd':'right', 'D':'right',
+        ' ':'stop', 'l':'led=on', 'L':'led=on', '+':'plus', '=':'plus', '-':'minus'
+      };
+
+      var keyToId = {
+        'forward': ['k-w', 'k-up'], 'backward': ['k-s', 'k-down'], 'left': ['k-a', 'k-left'], 'right': ['k-d', 'k-right'],
+        'stop': ['k-space'], 'plus': ['k-plus'], 'minus': ['k-minus'], 'led=on': ['k-l'], 'led=off': ['k-l']
+      };
+      var activeKeyIds = [];
+
+      function updateKeyIndicator(cmd) {
+        activeKeyIds.forEach(function(id) {
+          var el = document.getElementById(id);
+          if (el) el.classList.remove('active');
+        });
+        activeKeyIds = keyToId[cmd] || [];
+        activeKeyIds.forEach(function(id) {
+          var el = document.getElementById(id);
+          if (el) el.classList.add('active');
+        });
+        var labels = { forward:'↑', backward:'↓', left:'←', right:'→', stop:'●' };
+        var indicator = document.getElementById('keyIndicator');
+        if (indicator) indicator.textContent = labels[cmd] || '';
+      }
+
+      document.addEventListener('keydown', function(e) {
+        if (e.repeat) return;
+        var cmd = keyMap[e.key];
+        if (!cmd) return;
+        e.preventDefault();
+        pressedKeys[e.key] = true;
+
+        if (cmd === 'led=on') {
+          toggleLED(); return;
         }
-        var xhr = new XMLHttpRequest();
-        xhr.open("GET", "/action?led=" + (ledState ? "on" : "off"), true);
-        xhr.send();
+        if (cmd === 'plus' || cmd === 'minus') {
+           sendCmd(cmd); updateKeyIndicator(cmd); return;
+        }
+        sendCmd(cmd);
+        updateKeyIndicator(cmd);
+      });
+
+      document.addEventListener('keyup', function(e) {
+        var cmd = keyMap[e.key];
+        if (!cmd) return;
+        delete pressedKeys[e.key];
+        var movementKeys = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','w','s','a','d','W','S','A','D'];
+        var stillMoving = movementKeys.some(function(k) { return pressedKeys[k]; });
+        if (!stillMoving) {
+          sendCmd('stop');
+          updateKeyIndicator('stop');
+        }
+      });
+
+      // ======== Joystick Logic ========
+      function initJoystick() {
+        var canvas = document.getElementById("joy"), ctx = canvas.getContext("2d");
+        var W = canvas.width, H = canvas.height, cx = W/2, cy = H/2;
+        var outerR = 100, innerR = 36, kx = 0, ky = 0, dragging = false;
+        var cmdLabels = { forward:"للأمام ↑", backward:"للخلف ↓", left:"يسار ←", right:"يمين →", stop:"توقف" };
+
+        function getCmd(x, y) {
+          var d = Math.sqrt(x*x + y*y);
+          if (d < 0.25) return "stop";
+          var a = Math.atan2(y, x) * 180 / Math.PI;
+          if (a > -135 && a <= -45) return "forward";
+          if (a > 45 && a <= 135) return "backward";
+          if (a > -45 && a <= 45) return "right";
+          return "left";
+        }
+
+        function draw() {
+          ctx.clearRect(0,0,W,H);
+          ctx.beginPath(); ctx.arc(cx,cy,outerR,0,Math.PI*2); ctx.fillStyle = "#1e1e1e"; ctx.fill();
+          ctx.strokeStyle = "#444"; ctx.lineWidth = 1.5; ctx.stroke();
+          ctx.strokeStyle = "#333"; ctx.lineWidth = 0.5;
+          ctx.beginPath(); ctx.moveTo(cx-outerR+12,cy); ctx.lineTo(cx+outerR-12,cy); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(cx,cy-outerR+12); ctx.lineTo(cx,cy+outerR-12); ctx.stroke();
+          var px = cx + kx*outerR, py = cy + ky*outerR;
+          ctx.strokeStyle = "rgba(55,138,221,0.4)"; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(px,py); ctx.stroke();
+          ctx.beginPath(); ctx.arc(px,py,innerR,0,Math.PI*2);
+          ctx.fillStyle = dragging ? "#185FA5" : "#2a2a2a"; ctx.fill();
+          ctx.strokeStyle = "#378ADD"; ctx.lineWidth = 2; ctx.stroke();
+        }
+
+        function update(ex, ey) {
+          var rect = canvas.getBoundingClientRect();
+          var dx = (ex - rect.left - cx) / outerR, dy = (ey - rect.top - cy) / outerR;
+          var dist = Math.sqrt(dx*dx + dy*dy);
+          if (dist > 1) { kx = dx/dist; ky = dy/dist; } else { kx = dx; ky = dy; }
+          var cmd = getCmd(kx, ky);
+          document.getElementById("vspd").textContent = Math.round(Math.min(1, dist) * 100) + "%";
+          document.getElementById("vdir").textContent = cmdLabels[cmd] || "—";
+          var lbl = document.getElementById("cmd-label");
+          lbl.textContent = cmdLabels[cmd]; lbl.classList.toggle("active", cmd !== "stop");
+          if (cmd !== lastCmd) { lastCmd = cmd; sendCmd(cmd); }
+          draw();
+        }
+
+        function release() {
+          if (!dragging) return;
+          dragging = false; kx = 0; ky = 0; lastCmd = '';
+          document.getElementById("vspd").textContent = "0%"; document.getElementById("vdir").textContent = "—";
+          document.getElementById("cmd-label").textContent = "ضع إصبعك هنا"; document.getElementById("cmd-label").classList.remove("active");
+          sendCmd("stop"); draw();
+        }
+
+        canvas.addEventListener("mousedown", function(e){ dragging=true; update(e.clientX,e.clientY); });
+        canvas.addEventListener("mousemove", function(e){ if(dragging) update(e.clientX,e.clientY); });
+        canvas.addEventListener("mouseup", release); canvas.addEventListener("mouseleave", release);
+        canvas.addEventListener("touchstart", function(e){ e.preventDefault(); dragging=true; update(e.touches[0].clientX,e.touches[0].clientY); }, {passive:false});
+        canvas.addEventListener("touchmove", function(e){ e.preventDefault(); if(dragging) update(e.touches[0].clientX,e.touches[0].clientY); }, {passive:false});
+        canvas.addEventListener("touchend", function(e){ e.preventDefault(); release(); }, {passive:false});
+        canvas.addEventListener("touchcancel", function(e){ e.preventDefault(); release(); }, {passive:false});
+        draw();
       }
     </script>
   </body>
@@ -307,6 +432,40 @@ static esp_err_t index_handler(httpd_req_t *req) {
   return httpd_resp_send(req, (const char *)INDEX_HTML, strlen(INDEX_HTML));
 }
 
+static esp_err_t action_handler(httpd_req_t *req) {
+  char query[256];
+  int len = httpd_req_get_url_query_len(req) + 1;
+
+  if (len <= 1 || len > (int)sizeof(query)) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request");
+    return ESP_OK;
+  }
+  if (httpd_req_get_url_query_str(req, query, len) != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read query");
+    return ESP_OK;
+  }
+
+  // --- Strict Validation for Reset/Restart ONLY via HTTP ---
+  if (query_equals(query, "reset", "wifi")) {
+    Serial.println("🔄 WiFi Reset requested via Web!");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "Resetting WiFi...", HTTPD_RESP_USE_STRLEN);
+    scheduleRestart(true);
+    return ESP_OK;
+  }
+
+  if (query_equals(query, "reset", "restart")) {
+    Serial.println("♻️ ESP32 Restart requested via Web!");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "Restarting...", HTTPD_RESP_USE_STRLEN);
+    scheduleRestart(false);
+    return ESP_OK;
+  }
+
+  httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Unknown command via HTTP");
+  return ESP_OK;
+}
+
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t *fb = NULL;
   esp_err_t res = ESP_OK;
@@ -315,9 +474,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   char part_buf[64];
 
   res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-  if (res != ESP_OK) {
-    return res;
-  }
+  if (res != ESP_OK) return res;
 
   while (true) {
     fb = esp_camera_fb_get();
@@ -327,13 +484,10 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     } else {
       if (fb->width > 400) {
         if (fb->format != PIXFORMAT_JPEG) {
-          bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+          bool ok = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
           esp_camera_fb_return(fb);
           fb = NULL;
-          if (!jpeg_converted) {
-            Serial.println("JPEG compression failed");
-            res = ESP_FAIL;
-          }
+          if (!ok) { Serial.println("JPEG compression failed"); res = ESP_FAIL; }
         } else {
           _jpg_buf_len = fb->len;
           _jpg_buf = fb->buf;
@@ -344,350 +498,120 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
       res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
     }
-    if (res == ESP_OK) {
+    if (res == ESP_OK)
       res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
-    }
-    if (res == ESP_OK) {
+    if (res == ESP_OK)
       res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-    }
-    if (fb) {
-      esp_camera_fb_return(fb);
-      fb = NULL;
-      _jpg_buf = NULL;
-    } else if (_jpg_buf) {
-      free(_jpg_buf);
-      _jpg_buf = NULL;
-    }
-    if (res != ESP_OK) {
-      break;
-    }
+
+    // Memory Leak Fix
+    if (fb) { esp_camera_fb_return(fb); fb = NULL; _jpg_buf = NULL; }
+    else if (_jpg_buf) { free(_jpg_buf); _jpg_buf = NULL; }
+
+    if (res != ESP_OK) break;
   }
   return res;
 }
 
-static esp_err_t action_handler(httpd_req_t *req) {
-  char query[100];
-  int len = httpd_req_get_url_query_len(req) + 1;
-  if (len > sizeof(query)) {
-    httpd_resp_send_404(req);
-    return ESP_OK;
-  }
-
-  if (httpd_req_get_url_query_str(req, query, len) == ESP_OK) {
-    // WiFi Reset Command
-    if (strstr(query, "reset=wifi")) {
-      Serial.println("🔄 WiFi Reset requested via Web!");
-      httpd_resp_set_type(req, "text/plain");
-      httpd_resp_send(req, "Resetting WiFi...", HTTPD_RESP_USE_STRLEN);
-      delay(500);
-      wm.resetSettings();
-      delay(1000);
-      ESP.restart();
-      return ESP_OK;
-    }
-    // ESP32 Restart Command
-    else if (strstr(query, "reset=restart")) {
-      Serial.println("♻️ ESP32 Restart requested via Web!");
-      httpd_resp_set_type(req, "text/plain");
-      httpd_resp_send(req, "Restarting...", HTTPD_RESP_USE_STRLEN);
-      delay(500);
-      ESP.restart();
-      return ESP_OK;
-    }
-    // Motor Controls
-    else if (strstr(query, "go=forward")) {
-      Serial.println("Forward");
-      analogWrite(MOTOR_R_PIN_1, 0);
-      analogWrite(MOTOR_R_PIN_2, MOTOR_R_Speed);
-      analogWrite(MOTOR_L_PIN_1, MOTOR_L_Speed);
-      analogWrite(MOTOR_L_PIN_2, 0);
-    } else if (strstr(query, "go=backward")) {
-      Serial.println("Backward");
-      analogWrite(MOTOR_R_PIN_1, MOTOR_R_Speed);
-      analogWrite(MOTOR_R_PIN_2, 0);
-      analogWrite(MOTOR_L_PIN_1, 0);
-      analogWrite(MOTOR_L_PIN_2, MOTOR_L_Speed);
-    } else if (strstr(query, "go=left")) {
-      Serial.println("Left");
-      analogWrite(MOTOR_R_PIN_1, 0);
-      analogWrite(MOTOR_R_PIN_2, MOTOR_R_Speed);
-      analogWrite(MOTOR_L_PIN_1, 0);
-      analogWrite(MOTOR_L_PIN_2, MOTOR_L_Speed);
-    } else if (strstr(query, "go=right")) {
-      Serial.println("Right");
-      analogWrite(MOTOR_R_PIN_1, MOTOR_R_Speed);
-      analogWrite(MOTOR_R_PIN_2, 0);
-      analogWrite(MOTOR_L_PIN_1, MOTOR_L_Speed);
-      analogWrite(MOTOR_L_PIN_2, 0);
-    } else if (strstr(query, "go=stop")) {
-      Serial.println("Stop");
-      analogWrite(MOTOR_R_PIN_1, 0);
-      analogWrite(MOTOR_R_PIN_2, 0);
-      analogWrite(MOTOR_L_PIN_1, 0);
-      analogWrite(MOTOR_L_PIN_2, 0);
-    } else if (strstr(query, "led=on")) {
-      Serial.println("LED ON");
-      digitalWrite(LED_GPIO_NUM, HIGH);
-    } else if (strstr(query, "led=off")) {
-      Serial.println("LED OFF");
-      digitalWrite(LED_GPIO_NUM, LOW);
-    } else if (strstr(query, "go=plus")) {
-      MOTOR_R_Speed = MOTOR_R_Speed + 85;
-      MOTOR_L_Speed = MOTOR_L_Speed + 85;
-      if (MOTOR_L_Speed >= 255) MOTOR_L_Speed = 255;
-      if (MOTOR_R_Speed >= 255) MOTOR_R_Speed = 255;
-      Serial.print("Speed UP - L:");
-      Serial.print(MOTOR_L_Speed);
-      Serial.print(" R:");
-      Serial.println(MOTOR_R_Speed);
-    } else if (strstr(query, "go=minus")) {
-      MOTOR_R_Speed = MOTOR_R_Speed - 85;
-      MOTOR_L_Speed = MOTOR_L_Speed - 85;
-      if (MOTOR_L_Speed <= 85) MOTOR_L_Speed = 85;
-      if (MOTOR_R_Speed <= 85) MOTOR_R_Speed = 85;
-      Serial.print("Speed DOWN - L:");
-      Serial.print(MOTOR_L_Speed);
-      Serial.print(" R:");
-      Serial.println(MOTOR_R_Speed);
-    }
-  }
-
-  httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
-  return ESP_OK;
-}
-
-// Handler للحصول على معلومات النظام (JSON)
-static esp_err_t info_handler(httpd_req_t *req) {
-  char json[400];  // زيادة الحجم لتجنب buffer overflow
-  snprintf(json, sizeof(json), 
-    "{\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"heap\":%d}",
-    WiFi.SSID().c_str(),
-    WiFi.localIP().toString().c_str(),
-    WiFi.RSSI(),
-    ESP.getFreeHeap()
-  );
-  
-  httpd_resp_set_type(req, "application/json");
-  return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
-}
-
+// ======== Server Initialization ========
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
-  
-  httpd_uri_t index_uri = {
-    .uri = "/",
-    .method = HTTP_GET,
-    .handler = index_handler,
-    .user_ctx = NULL
-  };
 
-  httpd_uri_t cmd_uri = {
-    .uri = "/action",
-    .method = HTTP_GET,
-    .handler = action_handler,
-    .user_ctx = NULL
-  };
-  
-  httpd_uri_t info_uri = {
-    .uri = "/info",
-    .method = HTTP_GET,
-    .handler = info_handler,
-    .user_ctx = NULL
-  };
-  
-  httpd_uri_t stream_uri = {
-    .uri = "/stream",
-    .method = HTTP_GET,
-    .handler = stream_handler,
-    .user_ctx = NULL
-  };
-  
+  httpd_uri_t index_uri  = { "/", HTTP_GET, index_handler, NULL };
+  httpd_uri_t action_uri = { "/action", HTTP_GET, action_handler, NULL };
+  httpd_uri_t stream_uri = { "/stream", HTTP_GET, stream_handler, NULL };
+
   if (httpd_start(&camera_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(camera_httpd, &index_uri);
-    httpd_register_uri_handler(camera_httpd, &cmd_uri);
-    httpd_register_uri_handler(camera_httpd, &info_uri);
+    httpd_register_uri_handler(camera_httpd, &action_uri);
   }
-  
   config.server_port += 1;
   config.ctrl_port += 1;
-  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+  if (httpd_start(&stream_httpd, &config) == ESP_OK)
     httpd_register_uri_handler(stream_httpd, &stream_uri);
+}
+
+// ======== WebSocket Backend ========
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("WS client #%u connected — IP: %s\n", client->id(), client->remoteIP().toString().c_str());
+    char welcome[128];
+    snprintf(welcome, sizeof(welcome), "{\"type\":\"hello\",\"heap\":%d,\"ip\":\"%s\"}", ESP.getFreeHeap(), WiFi.localIP().toString().c_str());
+    client->text(welcome);
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("WS client #%u disconnected\n", client->id());
+    // أوقف المحركات تلقائياً عند انقطاع الاتصال
+    analogWrite(MOTOR_R_PIN_1, 0); analogWrite(MOTOR_R_PIN_2, 0);
+    analogWrite(MOTOR_L_PIN_1, 0); analogWrite(MOTOR_L_PIN_2, 0);
+    Serial.println("Motors stopped — client disconnected");
+  } else if (type == WS_EVT_DATA) {
+    AwsFrameInfo *info = (AwsFrameInfo *)arg;
+    if (info->opcode != WS_TEXT) return;
+    char msg[64] = {0};
+    size_t copyLen = min(len, sizeof(msg) - 1);
+    memcpy(msg, data, copyLen);
+    executeCommand(msg);
   }
 }
 
-// ======== Setup Function ========
+void startWebSocketServer() {
+  ws.onEvent(onWsEvent);
+  wsServer.addHandler(&ws);
+  wsServer.begin();
+  Serial.println("WebSocket server started on port 82");
+}
+
+// ======== Setup & Loop ========
 void setup() {
-  // تعطيل Brown-out detector بشكل أقوى
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-  
-  // تأخير للاستقرار
   delay(1000);
 
-  // Initialize Serial
   Serial.begin(115200);
   Serial.setDebugOutput(false);
-  Serial.println("\n=== ESP32-CAM Robot Starting ===");
   
-  // طباعة سبب إعادة التشغيل
-  esp_reset_reason_t reset_reason = esp_reset_reason();
-  Serial.print("Reset reason: ");
-  switch(reset_reason) {
-    case ESP_RST_POWERON: Serial.println("Power-on reset"); break;
-    case ESP_RST_EXT: Serial.println("External reset"); break;
-    case ESP_RST_SW: Serial.println("Software reset"); break;
-    case ESP_RST_PANIC: Serial.println("Exception/panic reset"); break;
-    case ESP_RST_INT_WDT: Serial.println("Interrupt watchdog reset"); break;
-    case ESP_RST_TASK_WDT: Serial.println("Task watchdog reset"); break;
-    case ESP_RST_WDT: Serial.println("Other watchdog reset"); break;
-    case ESP_RST_DEEPSLEEP: Serial.println("Deep sleep reset"); break;
-    case ESP_RST_BROWNOUT: Serial.println("Brownout reset"); break;
-    case ESP_RST_SDIO: Serial.println("SDIO reset"); break;
-    default: Serial.println("Unknown reset"); break;
-  }
+  pinMode(MOTOR_R_PIN_1, OUTPUT); pinMode(MOTOR_R_PIN_2, OUTPUT);
+  pinMode(MOTOR_L_PIN_1, OUTPUT); pinMode(MOTOR_L_PIN_2, OUTPUT);
+  pinMode(LED_GPIO_NUM, OUTPUT); digitalWrite(LED_GPIO_NUM, LOW);
 
-  // Initialize Motor Pins
-  pinMode(MOTOR_R_PIN_1, OUTPUT);
-  pinMode(MOTOR_R_PIN_2, OUTPUT);
-  pinMode(MOTOR_L_PIN_1, OUTPUT);
-  pinMode(MOTOR_L_PIN_2, OUTPUT);
-  
-  // Initialize LED Pin
-  pinMode(LED_GPIO_NUM, OUTPUT);
-  digitalWrite(LED_GPIO_NUM, LOW);  // LED OFF initially
-
-  // Configure Camera
   camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.ledc_channel = LEDC_CHANNEL_0; config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM; config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM; config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM; config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000; config.pixel_format = PIXFORMAT_JPEG;
 
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_VGA;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-    Serial.println("PSRAM found");
+    config.frame_size = FRAMESIZE_VGA; config.jpeg_quality = 10; config.fb_count = 2;
   } else {
-    config.frame_size = FRAMESIZE_HVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 1;
-    Serial.println("PSRAM not found");
+    config.frame_size = FRAMESIZE_HVGA; config.jpeg_quality = 12; config.fb_count = 1;
   }
 
-  // Camera init
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
-    return;
-  }
-  Serial.println("Camera initialized successfully");
+  esp_camera_init(&config);
 
-  // Wi-Fi connection using WiFiManager
-  Serial.println("Starting WiFi Manager...");
-  
-  // إعداد WiFi Manager مع تحسينات محسّنة
-  wm.setAPCallback(configModeCallback);
-  wm.setSaveConfigCallback(saveConfigCallback);
-  wm.setConfigPortalTimeout(180); // 3 دقائق timeout (معقول أكثر)
-  wm.setConnectTimeout(30); // 30 ثانية للاتصال (أفضل للشبكات البطيئة)
-  wm.setDebugOutput(true);
-  
-  // إعدادات Captive Portal - لفتح المتصفح تلقائياً
   wm.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-  wm.setCaptivePortalEnable(true); // تفعيل Captive Portal
-  
-  // إعدادات إضافية للاستقرار
-  wm.setConnectRetries(3); // محاولة الاتصال 3 مرات
-  wm.setCleanConnect(true); // قطع الاتصال قبل المحاولة الجديدة
-  wm.setRemoveDuplicateAPs(true); // إزالة الشبكات المكررة من القائمة
-  wm.setMinimumSignalQuality(10); // قبول الشبكات بإشارة ≥ 10%
-  wm.setSaveConnectTimeout(10000); // 10 ثواني للحفظ والاتصال
-  wm.setShowInfoUpdate(true); // إظهار معلومات التحديث
-  wm.setShowInfoErase(false); // إخفاء زر المسح
-  
-  // تحسين صفحة البوابة
-  wm.setTitle("ESP32-CAM Robot Setup"); // عنوان الصفحة
-  wm.setHostname("esp32cam-robot"); // اسم الجهاز
-  
-  // محاولة الاتصال التلقائي، أو فتح Portal للإعداد
-  Serial.println("Attempting WiFi connection...");
-  if (!wm.autoConnect("ESP32-CAM-Setup")) {
-    Serial.println("Failed to connect and hit timeout");
-    
-    // محاولة أخيرة قبل إعادة التشغيل
-    Serial.println("Resetting WiFi settings and trying again...");
-    wm.resetSettings();
-    delay(2000);
-    ESP.restart();
-  }
-  
-  Serial.println("\n✅ WiFi connected successfully!");
-  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  Serial.print("📡 SSID: ");
-  Serial.println(WiFi.SSID());
-  Serial.print("📶 Signal Strength: ");
-  Serial.print(WiFi.RSSI());
-  Serial.println(" dBm");
-  Serial.print("🌐 IP Address: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("🎥 Camera Stream: http://");
-  Serial.println(WiFi.localIP());
-  Serial.print("🎮 Control Panel: http://");
-  Serial.println(WiFi.localIP());
-  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+  wm.setCaptivePortalEnable(true);
+  if (!wm.autoConnect("ESP32-CAM-Setup")) { ESP.restart(); }
 
-  // 📸 فلاش الكاميرا (3 مرات) للتنبيه من الاتصال الناجح بالشبكة
-  Serial.println("📸 LED Flash - Connection Success Alert!");
-  blinkLED(3, 200);  // 3 مرات وميض مع تأخير 200ms
-
-  // إشارة نجاح - LED ثابت
-  digitalWrite(LED_GPIO_NUM, LOW);
-
-  // Start streaming web server
   startCameraServer();
-  Serial.println("HTTP server started");
-  
-  // طباعة معلومات الذاكرة
-  Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("Min free heap: %d bytes\n", ESP.getMinFreeHeap());
-  Serial.printf("Max alloc heap: %d bytes\n", ESP.getMaxAllocHeap());
+  startWebSocketServer();
 }
 
-// ======== Loop Function ========
 void loop() {
-  // متغير لمراقبة الذاكرة
-  static unsigned long lastMemCheck = 0;
-  
-  // فحص الذاكرة كل 10 ثواني
-  if (millis() - lastMemCheck > 10000) {
-    lastMemCheck = millis();
+  static unsigned long lastClean = 0;
+  if (millis() - lastClean > 5000) {
+    lastClean = millis();
+    ws.cleanupClients(); // يحذف العملاء المنقطعين من الذاكرة
+
     uint32_t freeHeap = ESP.getFreeHeap();
-    
-    Serial.printf("Free heap: %d bytes\n", freeHeap);
-    
-    // تحذير إذا كانت الذاكرة قليلة
-    if (freeHeap < 50000) {  // أقل من 50KB
-      Serial.println("⚠️ WARNING: Low memory detected!");
+    if (ws.count() > 0) {
+      char status[128];
+      snprintf(status, sizeof(status), "{\"heap\":%d}", freeHeap);
+      ws.textAll(status);
     }
+    if (freeHeap < 50000) Serial.println("WARNING: Low memory!");
   }
-  
-  // Server runs in background - no blocking needed
-  delay(100);
+  delay(10); // وقت تأخير منخفض بفضل AsyncWebServer
 }
